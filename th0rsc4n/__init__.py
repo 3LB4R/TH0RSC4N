@@ -1,0 +1,6 @@
+"""TH0RSC4N - Brutal OWASP Top 10 Security Scanner"""
+__version__ = "1.0.0"
+__author__ = "Thorranov"
+__tool_name__ = "TH0RSC4N"
+__tagline__ = "Brutal Security Scanner"
+__description__ = "60+ scenarios OWASP Top 10 2021 + Extra Vulnerabilities"

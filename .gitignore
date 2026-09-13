@@ -1,0 +1,34 @@
+@"
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Build
+dist/
+build/
+*.whl
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Reports
+th0rsc4n_report_*
+th0rsc4n-reports/
+*.html
+*.json
+
+# Config
+.env
+config.yml
+"@ | Out-File -Encoding utf8 .gitignore

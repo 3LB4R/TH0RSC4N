@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "th0rsc4n"
+version = "1.0.0"
+description = "TH0RSC4N - Brutal OWASP Top 10 Security Scanner"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Thorranov", email = "thorranov@proton.me"}
+]
+keywords = ["security", "owasp", "scanner", "pentest", "audit", "thorscan"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+]
+dependencies = [
+    "requests>=2.28.0",
+    "beautifulsoup4>=4.11.0",
+    "urllib3>=1.26.0",
+    "click>=8.0.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "jinja2>=3.0.0",
+]
+
+[project.scripts]
+th0rsc4n = "th0rsc4n.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "black", "flake8"]
+
+[tool.setuptools.packages.find]
+include = ["th0rsc4n*"]
+
+[tool.setuptools.package-data]
+th0rsc4n = ["data/*.yml", "data/*.txt"]
