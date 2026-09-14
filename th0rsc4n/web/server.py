@@ -2,6 +2,7 @@
 TH0RSC4N Web UI — Flask Server (Async)
 Non-blocking scan execution via asyncio.run() bridge.
 """
+import os
 import asyncio
 import json
 import time
@@ -59,12 +60,15 @@ async def _run_async_web_scan(scanner_instance, modules):
 # APP FACTORY
 # ==========================================
 def create_app():
+    # Absolute path — biar aman di OS manapun
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    template_dir = os.path.join(base_dir, "templates")
+    
     app = Flask(
         __name__,
-        template_folder="templates",
-        static_folder="static",
+        template_folder=template_dir,
+        static_folder=os.path.join(base_dir, "static"),
     )
-
     # ==========================================
     # INDEX
     # ==========================================
