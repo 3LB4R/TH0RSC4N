@@ -32,3 +32,9 @@ th0rsc4n-reports/
 .env
 config.yml
 "@ | Out-File -Encoding utf8 .gitignore                                              
+# Scan reports
+report.html
+report.json
+report.md
+report.pdf
+th0rsc4n_report_*
