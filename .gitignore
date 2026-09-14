@@ -31,4 +31,4 @@ th0rsc4n-reports/
 # Config
 .env
 config.yml
-"@ | Out-File -Encoding utf8 .gitignore
+"@ | Out-File -Encoding utf8 .gitignore                                              

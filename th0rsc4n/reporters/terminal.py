@@ -1,3 +1,4 @@
+"""Terminal reporter — colored output."""
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -14,38 +15,56 @@ SEVERITY_STYLES = {
     "SAFE": ("green", "🟢"),
 }
 
+
+def _is_distinct_url(url, target):
+    """Cek apakah URL endpoint beda dari root target."""
+    if not url or not target:
+        return False
+    return url.rstrip("/") != target.rstrip("/")
+
+
 def report(findings, target, verbose=False):
+    """Print findings ke terminal."""
     console.print()
     console.print(Panel.fit(
         f"[bold cyan]TARGET:[/bold cyan] [white]{target}[/white]",
-        title="[bold red]◤ TH0RSC4N REPORT ◢[/bold red]",
+        title="[bold red]<< TH0RSC4N REPORT >>[/bold red]",
         border_style="red",
     ))
-    
+
     # Group by category
     by_cat = {}
     for f in findings:
         by_cat.setdefault(f.category, []).append(f)
-    
+
     for category, items in by_cat.items():
-        console.print(f"\n[bold magenta]▶ {category}[/bold magenta]")
+        console.print(f"\n[bold magenta]>> {category}[/bold magenta]")
         for item in items:
             style, icon = SEVERITY_STYLES.get(item.severity, ("white", "•"))
             console.print(f"  {icon} [{style}]{item.severity:<8}[/{style}] {item.message}")
+
+            # 📍 Endpoint URL (jika beda dari target root)
+            if _is_distinct_url(getattr(item, "url", None), target):
+                console.print(f"      [dim cyan]📍 Endpoint: {item.url}[/dim cyan]")
+
+            # Mitigasi
             if item.mitigation:
                 console.print(f"      [dim]↳ {item.mitigation}[/dim]")
+
+            # Evidence (verbose)
             if verbose and item.evidence:
                 console.print(f"      [dim italic]Evidence: {item.evidence}[/dim italic]")
 
 
 def print_summary(stats, elapsed, mode_info=None):
+    """Print summary."""
     mode_line = ""
     if mode_info:
         mode_line = f"  [dim]Mode: {mode_info['icon']} {mode_info['name']}[/dim]\n"
-    
+
     console.print()
     console.print("[bold red]╔══════════════════════════════════════╗[/bold red]")
-    console.print("[bold red]║      ◤ TH0RSC4N SUMMARY ◢           ║[/bold red]")
+    console.print("[bold red]║      << TH0RSC4N SUMMARY >>          ║[/bold red]")
     console.print("[bold red]╚══════════════════════════════════════╝[/bold red]")
     if mode_line:
         console.print(mode_line, end="")

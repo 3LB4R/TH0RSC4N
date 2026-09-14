@@ -1,12 +1,15 @@
+"""HTML reporter — dark cyber theme."""
 from jinja2 import Template
 from datetime import datetime
 from pathlib import Path
+
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>TH0RSC4N Report - {{ target }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TH0RSC4N Report — {{ target }}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Courier New',monospace;background:#0a0e1a;color:#00ff88;padding:20px;line-height:1.6}
@@ -41,8 +44,10 @@ h2{color:#00ccff;margin:25px 0 15px;border-left:4px solid #00ccff;padding-left:1
 .severity.LOW{background:#00ccff;color:#000}
 .severity.INFO{background:#666;color:#fff}
 .severity.SAFE{background:#00ff88;color:#000}
+.url-badge{color:#00ccff;font-size:.88em;margin-top:8px;padding:6px 10px;background:#0a1420;border-left:2px solid #00ccff;border-radius:3px;word-break:break-all;font-family:'Courier New',monospace}
+.url-badge::before{content:'📍 ';margin-right:4px}
 .mitigation{color:#ffcc00;font-size:.9em;margin-top:8px;padding-left:10px;border-left:2px solid #ffcc00}
-.evidence{color:#666;font-size:.85em;margin-top:5px;font-style:italic}
+.evidence{color:#666;font-size:.85em;margin-top:5px;font-style:italic;padding-left:10px}
 .footer{text-align:center;color:#666;margin-top:40px;padding-top:20px;border-top:1px solid #333;font-size:.8em}
 .footer strong{color:#ff0044}
 </style>
@@ -57,7 +62,7 @@ h2{color:#00ccff;margin:25px 0 15px;border-left:4px solid #00ccff;padding-left:1
 <div><strong>Tool:</strong> TH0RSC4N v1.0.0 by Thorranov</div>
 </div>
 
-<h2>◤ SUMMARY ◢</h2>
+<h2><< SUMMARY >></h2>
 <div class="stats">
 <div class="stat-card critical"><div class="num">{{ stats.CRITICAL }}</div><div class="label">Critical</div></div>
 <div class="stat-card high"><div class="num">{{ stats.HIGH }}</div><div class="label">High</div></div>
@@ -67,16 +72,22 @@ h2{color:#00ccff;margin:25px 0 15px;border-left:4px solid #00ccff;padding-left:1
 <div class="stat-card safe"><div class="num">{{ stats.SAFE }}</div><div class="label">Safe</div></div>
 </div>
 
-<h2>◤ FINDINGS ◢</h2>
+<h2><< FINDINGS >></h2>
 {% for category, items in grouped.items() %}
-<div class="category">▶ {{ category }}</div>
+<div class="category">>> {{ category }}</div>
 {% for item in items %}
 <div class="finding {{ item.severity }}">
 <span class="severity {{ item.severity }}">{{ item.severity }}</span>
 <span>{{ item.message }}</span>
+
+{% if item.url and item.url != target %}
+<div class="url-badge">{{ item.url }}</div>
+{% endif %}
+
 {% if item.mitigation %}
 <div class="mitigation">↳ Mitigasi: {{ item.mitigation }}</div>
 {% endif %}
+
 {% if item.evidence %}
 <div class="evidence">Evidence: {{ item.evidence }}</div>
 {% endif %}
@@ -93,21 +104,25 @@ by <strong>Thorranov</strong> | Cyber Intelligence
 </html>
 """
 
+
 def report(findings, target, output_path):
+    """Generate HTML report."""
     stats = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "SAFE": 0}
     grouped = {}
+
     for f in findings:
         stats[f.severity] = stats.get(f.severity, 0) + 1
         grouped.setdefault(f.category, []).append(f)
-    
+
+    # Render
     template = Template(HTML_TEMPLATE)
     html = template.render(
         target=target,
         findings=[f.to_dict() for f in findings],
         stats=stats,
-        grouped=grouped,
+        grouped={k: [f.to_dict() for f in v] for k, v in grouped.items()},
         date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
-    
+
     Path(output_path).write_text(html, encoding="utf-8")
     return output_path
