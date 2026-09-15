@@ -1,8 +1,10 @@
 """
-A05:2021 - Security Misconfiguration
+A02:2025 - Security Misconfiguration
 Adaptive + verbose error leak detection.
+Anti false-positive content-based verification for sensitive files.
 """
 import re
+import json
 import requests
 
 # Recommended headers
@@ -50,7 +52,34 @@ ERROR_SIGS = [
     r"C:\\xampp\\htdocs",
 ]
 
+# ==========================================
+# ENV VARIABLE PATTERNS (untuk verifikasi .env leak)
+# ==========================================
+ENV_PATTERNS = [
+    r"^[A-Z_][A-Z0-9_]*\s*=\s*\S+",        # KEY=value (uppercase)
+    r"^[A-Z_][A-Z0-9_]*\s*=\s*['\"].+['\"]",  # KEY="value"
+]
 
+ENV_KEYWORDS = [
+    "DB_", "DB_HOST", "DB_USER", "DB_PASS", "DB_NAME",
+    "APP_KEY", "APP_SECRET", "APP_ENV", "APP_DEBUG",
+    "SECRET_", "JWT_", "API_KEY", "ACCESS_KEY", "PRIVATE_KEY",
+    "AWS_", "STRIPE_", "SMTP_", "MAIL_", "REDIS_", "MONGO_",
+]
+
+# ==========================================
+# JSON INTERNAL KEYS (untuk verifikasi manifest/package.json)
+# ==========================================
+JSON_INTERNAL_KEYS = [
+    "dependencies", "devDependencies", "peerDependencies",
+    "compilerOptions", "chunks", "scripts", "version", "name",
+    "main", "module", "types", "engines", "resolutions",
+]
+
+
+# ==========================================
+# HELPERS
+# ==========================================
 def _detect_platform(headers):
     h = {k.lower(): v.lower() for k, v in headers.items()}
     server = h.get("server", "")
@@ -77,37 +106,183 @@ def _mitigation(platform, header, value):
     return m.get(platform, m["generic"])
 
 
+# ==========================================
+# CONTENT-BASED VERIFICATION
+# ==========================================
+def _verify_env_content(body):
+    """
+    Verifikasi apakah konten BENAR-BENAR file .env.
+    Return (is_valid, evidence_str)
+    """
+    if not body or len(body) < 10:
+        return (False, "")
+
+    # Harus TIDAK mengandung tag HTML (kalau ada HTML, ini false positive)
+    if re.search(r"<(?:html|body|head|div|script|!doctype)", body[:500], re.IGNORECASE):
+        return (False, "HTML detected")
+
+    # Cek pattern KEY=value
+    lines = body.strip().split("\n")
+    env_lines = 0
+    keyword_hits = []
+
+    for line in lines[:50]:  # Batasi 50 baris pertama
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Cek pattern KEY=value
+        for pat in ENV_PATTERNS:
+            if re.match(pat, line):
+                env_lines += 1
+                break
+
+        # Cek keyword sensitif
+        for kw in ENV_KEYWORDS:
+            if line.upper().startswith(kw):
+                keyword_hits.append(kw)
+
+    # Minimal 3 baris KEY=value ATAU 1 keyword sensitif (DB_, APP_KEY, dll)
+    if env_lines >= 3 or len(keyword_hits) >= 1:
+        evidence = f"EnvLines={env_lines}"
+        if keyword_hits:
+            evidence += f" | Keywords={keyword_hits[:3]}"
+        return (True, evidence)
+
+    return (False, f"Only {env_lines} env lines")
+
+
+def _verify_json_manifest(body, path):
+    """
+    Verifikasi apakah konten BENAR-BENAR file JSON manifest/package.json.
+    Return (is_valid, evidence_str)
+    """
+    if not body or len(body) < 10:
+        return (False, "")
+
+    # Harus TIDAK mengandung tag HTML
+    if re.search(r"<(?:html|body|head|div|!doctype)", body[:500], re.IGNORECASE):
+        return (False, "HTML detected")
+
+    # Coba parse sebagai JSON
+    try:
+        # Cari JSON object mulai dari karakter { pertama
+        json_start = body.find("{")
+        if json_start == -1:
+            json_start = body.find("[")
+        if json_start == -1:
+            return (False, "No JSON structure")
+
+        json_str = body[json_start:]
+        # Batasi sampe 100KB
+        json_str = json_str[:100000]
+
+        # Coba parse beberapa kali dengan padding
+        parsed = None
+        for trim in [len(json_str), len(json_str) - 100, len(json_str) - 500]:
+            if trim < 10:
+                continue
+            try:
+                parsed = json.loads(json_str[:trim])
+                break
+            except json.JSONDecodeError:
+                continue
+
+        if parsed is None:
+            return (False, "Invalid JSON")
+
+        # Cek apakah ada key internal
+        if isinstance(parsed, dict):
+            keys = set(parsed.keys())
+            matched = [k for k in JSON_INTERNAL_KEYS if k in keys]
+            if matched:
+                return (True, f"JSON keys={matched[:3]}")
+
+            # Kalau gak ada key spesifik, tapi isinya JSON valid minimal 3 keys
+            if len(keys) >= 3:
+                return (True, f"JSON dict with {len(keys)} keys")
+
+        return (False, "JSON valid but no internal keys")
+
+    except Exception:
+        return (False, "Parse error")
+
+
+def _is_homepage_spa(body, homepage_body):
+    """
+    Cek apakah body identik/sangat mirip dengan homepage (indikasi SPA routing).
+    Return True kalau ini false positive.
+    """
+    if not body or not homepage_body:
+        return False
+
+    # Cek apakah ada tag HTML utuh (SPA routing biasanya return HTML homepage)
+    has_html = bool(re.search(r"<html|<!doctype", body[:500], re.IGNORECASE))
+    if not has_html:
+        return False
+
+    # Bandingkan dengan homepage: kalau 80% mirip → false positive
+    # Bandingkan jumlah tag dan judul
+    tags_body = set(re.findall(r"<(\w+)[\s>]", body, re.IGNORECASE))
+    tags_home = set(re.findall(r"<(\w+)[\s>]", homepage_body, re.IGNORECASE))
+
+    if not tags_body or not tags_home:
+        return False
+
+    intersection = tags_body & tags_home
+    union = tags_body | tags_home
+    similarity = len(intersection) / len(union) if union else 0
+
+    # Kalau >80% tag sama dengan homepage, kemungkinan besar SPA routing
+    if similarity > 0.8:
+        return True
+
+    # Cek apakah title sama dengan homepage
+    title_body = re.search(r"<title>([^<]+)</title>", body, re.IGNORECASE)
+    title_home = re.search(r"<title>([^<]+)</title>", homepage_body, re.IGNORECASE)
+    if title_body and title_home:
+        if title_body.group(1).strip() == title_home.group(1).strip():
+            return True
+
+    return False
+
+
+# ==========================================
+# MAIN SCAN
+# ==========================================
 def scan(scanner):
     """Entry point."""
     r = scanner.get()
 
     if not r:
-        # Fallback: pakai requests langsung
         try:
             r = requests.get(scanner.target, headers=scanner.headers,
                              timeout=15, verify=False, allow_redirects=True)
         except Exception as e:
-            scanner.add_finding("A05: Misconfig", "INFO", f"Tidak bisa konek: {e}")
+            scanner.add_finding("A02:2025 - Security Misconfiguration", "INFO",
+                                f"Tidak bisa konek: {e}")
             return
 
     h = r.headers
     h_lower = {k.lower(): v for k, v in h.items()}
     platform = _detect_platform(h)
+    homepage_body = r.text  # Simpan baseline homepage untuk perbandingan
 
     scanner.add_finding(
-        "A05: Misconfig", "INFO",
+        "A02:2025 - Security Misconfiguration", "INFO",
         f"Platform terdeteksi: {platform.upper()}",
         evidence=f"Server: {h.get('Server', 'N/A')}"
     )
 
-    # -------- 1. SECURITY HEADERS --------
+    # -------- 1. SECURITY HEADERS (case-insensitive) --------
     for header, (sev, desc, rec) in HEADERS_DB.items():
-        if header in h:
-            scanner.add_finding("A05: Misconfig", "SAFE", f"{header} aktif",
-                                evidence=h[header][:100])
+        header_lower = header.lower()
+        if header_lower in h_lower:
+            scanner.add_finding("A02:2025 - Security Misconfiguration", "SAFE",
+                                f"{header} aktif", evidence=h_lower[header_lower][:100])
         else:
             scanner.add_finding(
-                "A05: Misconfig", sev,
+                "A02:2025 - Security Misconfiguration", sev,
                 f"{header} HILANG ({desc})",
                 mitigation=_mitigation(platform, header, rec)
             )
@@ -115,18 +290,17 @@ def scan(scanner):
     # -------- 2. INFO DISCLOSURE --------
     if "server" in h_lower:
         server = h_lower["server"]
-        # Cek apakah versi bocor
         if re.search(r"[\d\.]+", server):
-            scanner.add_finding("A05: Misconfig", "LOW",
+            scanner.add_finding("A02:2025 - Security Misconfiguration", "LOW",
                                 f"Server header bocorkan versi: {server}",
                                 mitigation="Sembunyikan versi: nginx `server_tokens off;` / apache `ServerTokens Prod`")
         else:
-            scanner.add_finding("A05: Misconfig", "INFO",
+            scanner.add_finding("A02:2025 - Security Misconfiguration", "INFO",
                                 f"Server header: {server}",
                                 mitigation="Sembunyikan header Server")
 
     if "x-powered-by" in h_lower:
-        scanner.add_finding("A05: Misconfig", "LOW",
+        scanner.add_finding("A02:2025 - Security Misconfiguration", "LOW",
                             f"X-Powered-By bocor: {h_lower['x-powered-by']}",
                             mitigation="Hapus X-Powered-By (app.disable('x-powered-by'))")
 
@@ -135,11 +309,13 @@ def scan(scanner):
         rr = scanner.get(err_path)
         if not rr:
             continue
-        # Cek signature di response error
+        # Skip kalau ini SPA routing (return homepage)
+        if _is_homepage_spa(rr.text, homepage_body):
+            continue
         for sig in ERROR_SIGS:
             if re.search(sig, rr.text, re.IGNORECASE):
                 scanner.add_finding(
-                    "A05: Verbose Error Leak", "MEDIUM",
+                    "A02:2025 - Security Misconfiguration", "MEDIUM",
                     f"Stack trace bocor di {err_path}",
                     mitigation="Matikan debug mode di production. Custom error page.",
                     evidence=f"Signature: {sig[:60]}",
@@ -151,40 +327,113 @@ def scan(scanner):
         rr = scanner.get(p)
         if rr and "Index of /" in rr.text:
             scanner.add_finding(
-                "A05: Misconfig", "MEDIUM",
+                "A02:2025 - Security Misconfiguration", "MEDIUM",
                 f"Directory listing aktif di {p}",
                 mitigation="Nonaktifkan autoindex (nginx: `autoindex off;` / apache: `Options -Indexes`)"
             )
 
-    # -------- 5. SENSITIVE FILES --------
-        # -------- 5. SENSITIVE FILES (termasuk Next.js/Turbopack) --------
+    # -------- 5. SENSITIVE FILES (dengan Content-Based Verification) --------
     sensitive = [
         # Generic
-        "/.env", "/.git/HEAD", "/config.php", "/wp-config.php",
+        "/.env", "/.env.local", "/.env.production", "/.env.backup",
+        "/.git/HEAD", "/.git/config",
+        "/config.php", "/wp-config.php",
         "/backup.zip", "/.htaccess", "/server-status", "/.DS_Store",
+        # Next.js / NPM
         "/package.json", "/package-lock.json", "/yarn.lock",
-        # Next.js / Turbopack
         "/_next/static/development/_devPagesManifest.json",
         "/_next/static/development/_buildManifest.js",
         "/_next/static/chunks/webpack.js",
         "/_next/webpack-hmr",
-        # Vercel
+        # Vercel / Vercel-like
         "/.vercel/project.json",
-        # Common API docs
+        # API docs
         "/api-docs", "/swagger.json", "/openapi.json",
     ]
+
     for f in sensitive:
         rr = scanner.get(f)
-        if rr and rr.status_code == 200 and len(rr.text) > 10:
-            # Cek konten JSON (kemungkinan leak struktur)
-            body = rr.text[:500]
-            is_json = body.strip().startswith(("{", "["))
-            is_manifest = "_next" in f or "package.json" in f
+        if not rr or rr.status_code != 200:
+            continue
 
-            severity = "HIGH" if is_json or is_manifest else "MEDIUM"
+        body = rr.text
+        if len(body) < 10:
+            continue
+
+        # ==========================================
+        # VERIFIKASI 1: Bukan homepage SPA (false positive paling umum)
+        # ==========================================
+        if _is_homepage_spa(body, homepage_body):
+            continue  # FALSE POSITIVE — skip
+
+        # ==========================================
+        # VERIFIKASI 2: Content-based verification sesuai tipe file
+        # ==========================================
+        is_valid = False
+        verify_evidence = ""
+        severity = "MEDIUM"
+
+        if ".env" in f:
+            # Env file: harus punya pattern KEY=value
+            is_valid, verify_evidence = _verify_env_content(body)
+            severity = "CRITICAL"
+
+        elif "package.json" in f or "_next" in f or "manifest" in f or "vercel" in f or "swagger" in f or "openapi" in f:
+            # JSON file: harus parse JSON valid + ada key internal
+            is_valid, verify_evidence = _verify_json_manifest(body, f)
+            severity = "HIGH"
+
+        elif ".git/" in f:
+            # Git files: signature khas
+            if f.endswith("HEAD") and (body.startswith("ref:") or "refs/heads" in body):
+                is_valid = True
+                verify_evidence = "Git HEAD signature"
+                severity = "CRITICAL"
+            elif f.endswith("config") and "[core]" in body.lower():
+                is_valid = True
+                verify_evidence = "Git config signature"
+                severity = "CRITICAL"
+
+        elif ".htaccess" in f:
+            # .htaccess: signature khas
+            if any(k in body for k in ["RewriteEngine", "Order deny", "Require all", "<IfModule"]):
+                is_valid = True
+                verify_evidence = ".htaccess signature"
+                severity = "MEDIUM"
+
+        elif ".DS_Store" in f:
+            # .DS_Store: binary magic bytes
+            if body.startswith("\x00\x00\x00\x01Bud1") or "Bud1" in body[:10]:
+                is_valid = True
+                verify_evidence = ".DS_Store magic bytes"
+                severity = "LOW"
+
+        elif "backup" in f.lower() and f.endswith(".zip"):
+            # Backup zip: signature PK
+            if body.startswith("PK\x03\x04"):
+                is_valid = True
+                verify_evidence = "ZIP magic bytes"
+                severity = "HIGH"
+
+        elif "server-status" in f:
+            # Apache server-status signature
+            if "Apache Server Status" in body:
+                is_valid = True
+                verify_evidence = "Apache server-status"
+                severity = "HIGH"
+
+        # ==========================================
+        # REPORT kalau lolos verifikasi
+        # ==========================================
+        if is_valid:
             scanner.add_finding(
-                f"A05: Sensitive File ({severity})", severity,
+                "A02:2025 - Security Misconfiguration", severity,
                 f"File sensitif terekspos: {f}",
-                mitigation="Blokir akses ke file konfigurasi & manifest. Untuk Next.js, pastikan `_next/static/development/` tidak di-deploy ke production.",
-                evidence=f"HTTP 200 | Size: {len(rr.text)} bytes | JSON: {is_json}"
+                mitigation=(
+                    "Blokir akses ke file konfigurasi & manifest. "
+                    "Untuk Next.js, pastikan `_next/static/development/` tidak di-deploy ke production. "
+                    "Untuk .env, hapus dari public folder & gunakan environment variables."
+                ),
+                evidence=f"HTTP 200 | Size: {len(body)} bytes | {verify_evidence}",
+                url=scanner.target.rstrip("/") + f,
             )

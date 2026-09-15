@@ -1,12 +1,20 @@
 """
-A10:2021 - Server-Side Request Forgery (SSRF)
-Async: Loopback, AWS metadata, scheme-based.
+A10:2025 - Mishandling of Exceptional Conditions (SSRF)
+Refactored: Split direct-signature vs blind-timing payloads.
+Only test URL-like params or max 3 params if no URL param.
 """
 import asyncio
-import re
+import time
 from urllib.parse import urlparse, parse_qs, urlencode
 
-SSRF_PAYLOADS = [
+
+CATEGORY = "A10:2025 - Mishandling of Exceptional Conditions"
+
+# ==========================================
+# DIRECT SSRF PAYLOADS (signature-based)
+# Response dari server akan mengandung signature khas
+# ==========================================
+SSRF_DIRECT_PAYLOADS = [
     # Loopback
     "http://127.0.0.1:80",
     "http://localhost:80",
@@ -23,7 +31,6 @@ SSRF_PAYLOADS = [
     "gopher://127.0.0.1:6379/_INFO",
 ]
 
-# Signature response berhasil SSRF
 SSRF_SIGNATURES = [
     "root:x:0:0",
     "ami-id", "instance-id", "iam/security-credentials",
@@ -33,10 +40,37 @@ SSRF_SIGNATURES = [
     "SSH-2.0", "OpenSSH",
 ]
 
-SSRF_PARAMS = ["url", "uri", "path", "src", "dest", "redirect",
-               "proxy", "fetch", "callback", "image", "target", "link"]
+# ==========================================
+# BLIND SSRF PAYLOADS (timing-based)
+# Non-routable / blackhole IP — packet dropped
+# ==========================================
+SSRF_BLIND_PAYLOADS = [
+    "http://10.255.255.1:81/",      # RFC1918 — packet dropped
+    "http://192.0.2.1:8080/",       # TEST-NET-1 — non-routable
+    "http://198.51.100.1:80/",      # TEST-NET-2 — non-routable
+]
+
+# ==========================================
+# PARAMETER KEYWORDS (untuk filter agresif)
+# Hanya test parameter yang namanya mengandung keyword ini
+# ==========================================
+URL_PARAM_KEYWORDS = [
+    "url", "uri", "redirect", "target", "dest",
+    "src", "feed", "webhook", "callback", "link",
+    "next", "return", "goto", "image", "proxy",
+    "fetch", "path", "file", "host", "domain",
+]
+
+# Batas maksimal parameter jika tidak ada URL-like param
+MAX_PARAMS_IF_NO_MATCH = 3
+
+# Blind SSRF: timeout 5 detik untuk deteksi drop packet
+BLIND_TIMEOUT = 5
 
 
+# ==========================================
+# HELPERS
+# ==========================================
 def _inject(url, param, payload):
     p = urlparse(url)
     q = parse_qs(p.query)
@@ -44,62 +78,102 @@ def _inject(url, param, payload):
     return f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q, doseq=True)}"
 
 
-async def _run_async(scanner):
-    params_from_url = list(parse_qs(urlparse(scanner.target).query).keys())
-    params = list(set(params_from_url + SSRF_PARAMS))
+def _filter_url_params(all_params):
+    """
+    Filter parameter: hanya yang mengandung URL_PARAM_KEYWORDS.
+    Kalau tidak ada, ambil MAX_PARAMS_IF_NO_MATCH pertama.
+    """
+    if not all_params:
+        return []
 
+    url_like = [p for p in all_params if any(kw in p.lower() for kw in URL_PARAM_KEYWORDS)]
+
+    if url_like:
+        return url_like
+
+    # Fallback: max N parameter
+    return all_params[:MAX_PARAMS_IF_NO_MATCH]
+
+
+# ==========================================
+# MAIN SCAN
+# ==========================================
+async def _run_async(scanner):
+    # Ambil parameter dari URL target
+    params_from_url = list(parse_qs(urlparse(scanner.target).query).keys())
+
+    # Filter ke URL-like parameter saja
+    params = _filter_url_params(params_from_url)
+
+    if not params:
+        scanner.add_finding(
+            CATEGORY, "SAFE",
+            "Tidak ada parameter URL-like untuk diuji SSRF",
+        )
+        return
+
+    # ==========================================
+    # PHASE 1: Direct SSRF (signature-based)
+    # ==========================================
     tasks = []
     meta = []
     for param in params:
-        for payload in SSRF_PAYLOADS:
+        for payload in SSRF_DIRECT_PAYLOADS:
             url = _inject(scanner.target, param, payload)
             tasks.append(scanner.aget(url))
             meta.append((param, payload))
 
-    results = await scanner.agather(tasks)
-    for (param, payload), r in zip(meta, results):
-        if not r or not isinstance(r, dict):
-            continue
-        body = r.get("body", "")
-        for sig in SSRF_SIGNATURES:
-            if sig in body:
-                scanner.add_finding(
-                    "A10: SSRF", "HIGH",
-                    f"Parameter '{param}' rentan SSRF",
-                    mitigation="Whitelist URL/domain. Blokir IP internal & metadata. Validasi protocol.",
-                    evidence=f"Payload: {payload} | Signature: {sig}",
-                )
-                return
+    if tasks:
+        results = await scanner.agather(tasks)
+        for (param, payload), r in zip(meta, results):
+            if not isinstance(r, dict):
+                continue
+            body = r.get("body", "")
+            for sig in SSRF_SIGNATURES:
+                if sig in body:
+                    scanner.add_finding(
+                        CATEGORY, "HIGH",
+                        f"Parameter '{param}' rentan SSRF (direct signature)",
+                        mitigation="Whitelist URL/domain. Blokir IP internal & cloud metadata. Validasi protocol.",
+                        evidence=f"Payload: {payload} | Signature: {sig}",
+                    )
+                    return
 
-    # Cek Response Time (blind SSRF)
-    # Kalau target lambat merespons internal IP, ada indikasi
-    t0 = asyncio.get_event_loop().time()
+    # ==========================================
+    # PHASE 2: Blind SSRF (timing-based)
+    # Gunakan blackhole IP + timeout 5 detik
+    # ==========================================
+    # Ambil baseline timing
+    t0 = time.perf_counter()
     r = await scanner.aget(scanner.target)
-    baseline = asyncio.get_event_loop().time() - t0 if r else 0
+    baseline = time.perf_counter() - t0 if r else 0
 
-    for param in params[:5]:
-        for payload in SSRF_PAYLOADS[:3]:  # cuma 3 payload
+    for param in params[:3]:  # Batasi max 3 param
+        for payload in SSRF_BLIND_PAYLOADS:
             url = _inject(scanner.target, param, payload)
-            t0 = asyncio.get_event_loop().time()
+            t0 = time.perf_counter()
             await scanner.aget(url)
-            elapsed = asyncio.get_event_loop().time() - t0
-            if elapsed > max(baseline * 3, 5):
+            elapsed = time.perf_counter() - t0
+
+            # Deteksi delay signifikan: > 3× baseline DAN > BLIND_TIMEOUT
+            if elapsed > max(baseline * 3, BLIND_TIMEOUT):
                 scanner.add_finding(
-                    "A10: SSRF (Blind)", "MEDIUM",
-                    f"Parameter '{param}' potensi blind SSRF (delay {elapsed:.1f}s)",
-                    mitigation="Blokir request ke IP internal di server-side",
+                    CATEGORY, "MEDIUM",
+                    f"Parameter '{param}' potensi blind SSRF (delay {elapsed:.2f}s)",
+                    mitigation="Blokir request ke IP internal di server-side. Rate limit outbound request.",
                     evidence=f"Payload: {payload} | Baseline: {baseline:.2f}s | Payload: {elapsed:.2f}s",
                 )
                 return
 
-    scanner.add_finding("A10: SSRF", "SAFE", "Tidak ada SSRF terdeteksi")
+    scanner.add_finding(CATEGORY, "SAFE", "Tidak ada SSRF terdeteksi")
 
 
 def scan(scanner):
+    """Entry point — dipanggil dari cli.py."""
     try:
         asyncio.run(_run_async(scanner))
     except RuntimeError:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(_run_async(scanner))
     except Exception as e:
-        scanner.add_finding("A10: SSRF", "INFO", f"Error: {e}")
+        scanner.add_finding(CATEGORY, "INFO", f"Error: {e}")

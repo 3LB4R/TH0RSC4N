@@ -105,7 +105,7 @@ def scan(scanner):
                 "source": "meta generator",
             })
         scanner.add_finding(
-            "A03:2025 - Software Supply Chain Failures", "LOW",
+            "A06: Components", "LOW",
             f"Meta generator bocor: {content}",
             mitigation="Hapus meta generator dari HTML"
         )
@@ -116,16 +116,16 @@ def scan(scanner):
             ["password", "api_key", "secret", "todo", "fixme", "token"])]
     if sens:
         scanner.add_finding(
-            "A03:2025 - Software Supply Chain Failures", "MEDIUM",
+            "A06: Components", "MEDIUM",
             f"{len(sens)} komentar sensitif ditemukan di HTML",
             mitigation="Hapus komentar yang mengandung info sensitif sebelum deploy"
         )
     else:
-        scanner.add_finding("A03:2025 - Software Supply Chain Failures", "SAFE", "Tidak ada komentar sensitif")
+        scanner.add_finding("A06: Components", "SAFE", "Tidak ada komentar sensitif")
     
     # Report detected tech
     if not detected:
-        scanner.add_finding("A03:2025 - Software Supply Chain Failures", "SAFE", 
+        scanner.add_finding("A06: Components", "SAFE", 
                             "Tidak ada library eksternal dengan versi terekspos")
         return
     
@@ -140,24 +140,24 @@ def scan(scanner):
             if _version_tuple(version) < _version_tuple(vuln["vulnerable_below"]):
                 cves = ", ".join(vuln["cves"])
                 scanner.add_finding(
-                    "A03:2025 - Software Supply Chain Failures", "HIGH",
+                    "A06: Components", "HIGH",
                     f"{name} v{version} rentan (dari {source})",
                     mitigation=f"Update ke versi >= {vuln['vulnerable_below']}. CVE: {cves}"
                 )
             else:
                 scanner.add_finding(
-                    "A03:2025 - Software Supply Chain Failures", "SAFE",
+                    "A06: Components", "SAFE",
                     f"{name} v{version} (up-to-date)"
                 )
         else:
             scanner.add_finding(
-                "A03:2025 - Software Supply Chain Failures", "INFO",
+                "A06: Components", "INFO",
                 f"{name} v{version} terdeteksi (dari {source})"
             )
     
     # Saran umum
     scanner.add_finding(
-        "A03:2025 - Software Supply Chain Failures", "INFO",
+        "A06: Components", "INFO",
         f"Total {len(detected)} library terdeteksi — rutin update dependensi",
         mitigation="Gunakan Dependabot / npm audit / pip-audit untuk monitoring CVE"
     )

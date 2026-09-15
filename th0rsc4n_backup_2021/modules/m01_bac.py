@@ -1,8 +1,7 @@
 """
 A01:2025 - Broken Access Control (Universal)
 - Multi-path admin discovery + content validation
-- Redirect-aware (allow_redirects=False)
-- IDOR testing (numeric)
+- IDOR testing (numeric + UUID)
 - CORS misconfiguration
 - Anti false-positive heuristic
 """
@@ -11,27 +10,38 @@ import re
 from urllib.parse import urlparse, parse_qs, urlencode
 
 
+# ==========================================
+# ADMIN PATHS (Universal)
+# ==========================================
 ADMIN_PATHS = [
+    # Generic admin
     "/admin", "/admin/", "/admin/login", "/admin/dashboard",
     "/administrator", "/administrator/", "/administrator/index.php",
     "/panel", "/cpanel", "/dashboard", "/console", "/manage",
     "/management", "/backend", "/control", "/control-panel",
+    # CMS
     "/wp-admin", "/wp-admin/", "/wp-login.php",
     "/wp-content/uploads/", "/wp-json/wp/v2/users",
     "/drupal/admin", "/administrator/manifests/files/joomla.xml",
+    # API
     "/api/admin", "/api/v1/admin", "/api/users", "/api/v1/users",
     "/api/me", "/api/profile",
+    # Config files
     "/.env", "/.env.local", "/.env.production",
     "/.git/HEAD", "/.git/config",
     "/config.php", "/config.json", "/config.yaml",
     "/wp-config.php", "/database.yml",
+    # Backup
     "/backup.zip", "/backup.sql", "/backup.tar.gz", "/db.sql",
+    # Monitoring
     "/server-status", "/server-info", "/actuator",
     "/actuator/health", "/actuator/env", "/actuator/beans",
+    # Metadata
     "/.well-known/security.txt", "/robots.txt", "/sitemap.xml",
     "/humans.txt", "/crossdomain.xml",
 ]
 
+# False positive keywords (halaman 404 kosmetik)
 FP_KEYWORDS = [
     "404", "not found", "tidak ditemukan", "not_found",
     "page could not be found", "lost in space",
@@ -42,6 +52,7 @@ FP_KEYWORDS = [
     "404 |", "| 404", "404 -",
 ]
 
+# Admin content keywords (halaman admin ASLI)
 ADMIN_KEYWORDS = [
     "password", "login", "username", "signin", "sign in",
     "sign-in", "dashboard", "admin panel", "adminpanel",
@@ -52,6 +63,7 @@ ADMIN_KEYWORDS = [
     "forgot password", "reset password",
 ]
 
+# IDOR parameters
 IDOR_PARAMS = [
     "id", "user_id", "uid", "userid", "account_id", "account",
     "invoice", "invoice_id", "order", "order_id",
@@ -60,28 +72,39 @@ IDOR_PARAMS = [
 ]
 
 
+# ==========================================
+# HEURISTIC VALIDATOR
+# ==========================================
 def _is_false_positive(body: str) -> bool:
+    """Return True jika body cuma halaman 404 kosmetik."""
     if not body or len(body) < 100:
         return True
     body_low = body.lower()
     fp_hits = sum(1 for kw in FP_KEYWORDS if kw in body_low)
+    # Kalau ada >= 2 keyword 404, kemungkinan besar false positive
     if fp_hits >= 2:
         return True
+    # Cek apakah ada tag 404 khas
     if re.search(r"<title>[^<]*404[^<]*</title>", body, re.IGNORECASE):
         return True
+    # Cek Vercel/Next.js 404 page
     if "lost in space" in body_low or "page could not be found" in body_low:
         return True
     return False
 
 
 def _has_admin_content(body: str) -> tuple:
+    """Return (bool, evidence_str) apakah body mengandung form/element admin ASLI."""
     if not body:
         return False, ""
     body_low = body.lower()
+
+    # Keyword hits
     found = [kw for kw in ADMIN_KEYWORDS if kw in body_low]
     if not found:
         return False, ""
 
+    # Verifikasi struktural: harus ada form / input / JSON auth
     has_form = bool(re.search(r"<form[\s>]", body, re.IGNORECASE))
     has_input = bool(re.search(r"<input[\s>]", body, re.IGNORECASE))
     has_button = bool(re.search(r"<button[\s>].*?(?:login|signin|submit)", body, re.IGNORECASE | re.DOTALL))
@@ -96,28 +119,28 @@ def _has_admin_content(body: str) -> tuple:
 
 
 def _has_personal_data(body: str) -> bool:
+    """Cek apakah body mengandung data personal (indikasi IDOR valid)."""
     if not body:
         return False
+    # Email
     if re.search(r"[\w\.\-]+@[\w\.\-]+\.\w{2,}", body):
         return True
+    # Phone
     if re.search(r"(?:\+?\d{1,3}[\s\-]?)?\d{9,15}", body):
         return True
+    # JSON keys personal
     if re.search(r'"(?:name|email|phone|address|dob|ssn|credit)"\s*:', body, re.IGNORECASE):
         return True
     return False
 
 
+# ==========================================
+# SCAN FUNCTIONS
+# ==========================================
 async def _scan_admin_paths(scanner):
-    """Scan admin paths dengan redirect-aware + content validation."""
+    """Scan admin paths dengan content validation."""
     base_url = scanner.target.rstrip("/")
-    parsed_target = urlparse(base_url)
-    target_path = parsed_target.path or "/"
-
-    # allow_redirects=False — supaya bisa deteksi redirect 301/302/307/308
-    tasks = [
-        scanner.aget(base_url + p, allow_redirects=False)
-        for p in ADMIN_PATHS
-    ]
+    tasks = [scanner.aget(base_url + p) for p in ADMIN_PATHS]
     results = await scanner.agather(tasks)
 
     found = False
@@ -126,47 +149,17 @@ async def _scan_admin_paths(scanner):
             continue
         status = r.get("status", 0)
         body = r.get("body", "")
-        final_url = r.get("url", "")
 
-        # ==========================================
-        # Redirect handling: 301/302/307/308 = PROTECTED (SAFE)
-        # Kecuali redirect ke halaman login (indikasi auth) → tetap SAFE
-        # ==========================================
-        if status in (301, 302, 307, 308):
-            location = r.get("headers", {}).get("location", "")
-            # Redirect ke /login atau / = proteksi
-            if any(kw in location.lower() for kw in ["/login", "/signin", "/auth", "/"]):
-                # Ini proteksi, bukan vuln
-                continue
-            continue
-
-        # ==========================================
-        # Harus HTTP 200 langsung
-        # ==========================================
         if status != 200:
             continue
-
-        # ==========================================
-        # Verifikasi URL akhir TETAP di target path
-        # ==========================================
-        if final_url:
-            final_parsed = urlparse(final_url)
-            final_path = final_parsed.path
-            # Kalau URL akhir berpindah ke root / bukan path yang diuji → SKIP
-            if final_path.rstrip("/") != (target_path.rstrip("/") + path.rstrip("/")).rstrip("/"):
-                # Toleransi kalau path = "/" (homepage)
-                if final_path == "/" and path != "/":
-                    continue
-
         # Skip 404 kosmetik
         if _is_false_positive(body):
             continue
-
         # Validasi admin content
         is_admin, evidence = _has_admin_content(body)
         if is_admin:
             scanner.add_finding(
-                "A01:2025 - Broken Access Control",
+                "A01: Admin Panel Exposed",
                 "HIGH",
                 f"Panel admin dapat diakses tanpa otentikasi: {path}",
                 mitigation=(
@@ -181,7 +174,7 @@ async def _scan_admin_paths(scanner):
 
     if not found:
         scanner.add_finding(
-            "A01:2025 - Broken Access Control",
+            "A01: Admin Path",
             "SAFE",
             f"Tidak ada panel admin yang terekspos (dari {len(ADMIN_PATHS)} path diuji)",
         )
@@ -206,19 +199,22 @@ async def _scan_idor(scanner):
         len_1 = len(body_1)
         len_2 = len(body_2)
 
+        # Skip kalau response kosong atau sama
         if len_1 < 200 or len_2 < 200:
             continue
         if len_1 == len_2:
             continue
 
+        # Delta signifikan?
         delta = abs(len_1 - len_2)
         if delta < 200:
             continue
 
+        # Cek personal data
         combined = body_1 + body_2
         if _has_personal_data(combined):
             scanner.add_finding(
-                "A01:2025 - Broken Access Control",
+                "A01: IDOR",
                 "MEDIUM",
                 f"Parameter '{param}' berpotensi IDOR (delta {delta} bytes)",
                 mitigation=(
@@ -232,7 +228,7 @@ async def _scan_idor(scanner):
 
     if not is_idor_found:
         scanner.add_finding(
-            "A01:2025 - Broken Access Control",
+            "A01: IDOR",
             "SAFE",
             f"Tidak ada IDOR terdeteksi ({len(IDOR_PARAMS)} parameter diuji)",
         )
@@ -252,7 +248,7 @@ async def _scan_cors(scanner):
 
     if acao == origin_evil and acac == "true":
         scanner.add_finding(
-            "A01:2025 - Broken Access Control",
+            "A01: CORS Misconfiguration",
             "HIGH",
             "CORS salah konfigurasi — origin attacker diizinkan dengan credentials",
             mitigation=(
@@ -263,7 +259,7 @@ async def _scan_cors(scanner):
         )
     elif acao == origin_evil:
         scanner.add_finding(
-            "A01:2025 - Broken Access Control",
+            "A01: CORS Misconfiguration",
             "MEDIUM",
             "CORS merefleksikan origin attacker",
             mitigation="Batasi ACAO ke whitelist domain yang dikenal",
@@ -271,7 +267,7 @@ async def _scan_cors(scanner):
         )
     elif acao == "*":
         scanner.add_finding(
-            "A01:2025 - Broken Access Control",
+            "A01: CORS Wildcard",
             "LOW",
             "CORS wildcard (*) — memungkinkan akses dari mana saja",
             mitigation="Batasi ACAO ke domain spesifik",
@@ -279,14 +275,18 @@ async def _scan_cors(scanner):
         )
     else:
         scanner.add_finding(
-            "A01:2025 - Broken Access Control",
+            "A01: CORS",
             "SAFE",
             "Konfigurasi CORS terlihat aman",
             evidence=f"ACAO: {acao or '(tidak ada)'}",
         )
 
 
+# ==========================================
+# MAIN
+# ==========================================
 async def _run(scanner):
+    # Jalankan 3 sub-scan paralel
     await asyncio.gather(
         _scan_admin_paths(scanner),
         _scan_idor(scanner),
@@ -303,4 +303,4 @@ def scan(scanner):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(_run(scanner))
     except Exception as e:
-        scanner.add_finding("A01:2025 - Broken Access Control", "INFO", f"Error: {e}")
+        scanner.add_finding("A01: BAC", "INFO", f"Error: {e}")

@@ -1,10 +1,9 @@
 """
-A05:2025 - Injection (Universal Multi-Method & Multi-Format)
+A03:2025 - Injection (Universal Multi-Method & Multi-Format)
 - GET fuzzing jika ada parameter
 - POST fallback (JSON / Form-Data) ke endpoint API universal
 - SQLi Error/Boolean/Time, XSS, CMDi, SSTI, NoSQLi
 - Async time-based detection dengan akurasi tinggi
-- Response Variance Baseline untuk anti false-positive SQLi Boolean
 """
 import asyncio
 import re
@@ -40,18 +39,24 @@ SQLI_TIME_PAYLOADS = [
 ]
 
 SQLI_ERROR_SIGS = [
+    # MySQL
     "you have an error in your sql syntax",
     "warning: mysql_", "mysql_fetch_array()",
     "mysql_num_rows()", "supplied argument is not a valid mysql",
     "mysqli_sql_exception",
+    # PostgreSQL
     "postgresql query failed", "pg_query()",
     "pg::", "syntax error at or near",
     "unterminated quoted string",
+    # Oracle
     "ora-01756", "ora-00933", "ora-00921", "ora-00904",
+    # SQLite
     "sqlite3.operationalerror", "sqlite error", "sql error",
+    # MSSQL
     "unclosed quotation mark",
     "microsoft ole db provider for sql server",
     "odbc sql server driver", "sqlstate",
+    # Generic
     "syntax error", "sql syntax", "database error",
 ]
 
@@ -63,7 +68,7 @@ NOSQL_PAYLOADS = [
 ]
 NOSQL_ERROR_SIGS = [
     "mongoerror", "bsontypeerror", "e11000 duplicate key",
-    "cast to objectid failed",
+    "mongoerror", "cast to objectid failed",
 ]
 
 XSS_PAYLOADS = [
@@ -101,6 +106,9 @@ SSTI_PAYLOADS = [
 ]
 
 
+# ==========================================
+# POST FALLBACK ENDPOINTS
+# ==========================================
 API_ENDPOINTS = [
     "/api/login", "/api/signin", "/api/auth", "/api/auth/login",
     "/api/search", "/api/query", "/api/v1/query", "/api/v1/search",
@@ -166,74 +174,12 @@ def _reflects_payload(body, payload):
 
 
 # ==========================================
-# RESPONSE VARIANCE BASELINE (Anti False-Positive)
-# ==========================================
-async def _get_response_variance(scanner, samples=3):
-    """
-    Ambil baseline panjang response dari beberapa request ke target.
-    Return (avg_len, min_len, max_len, jitter_tolerance)
-    Jitter tolerance = max_len - min_len (fluktuasi natural website).
-    """
-    lengths = []
-    for _ in range(samples):
-        r = await scanner.aget(scanner.target)
-        if isinstance(r, dict):
-            lengths.append(len(r.get("body", "")))
-        await asyncio.sleep(0.2)  # Small delay antar sample
-
-    if not lengths:
-        return (0, 0, 0, 0)
-
-    avg = sum(lengths) / len(lengths)
-    min_len = min(lengths)
-    max_len = max(lengths)
-    # Jitter tolerance: fluktuasi alami + margin 20%
-    jitter = (max_len - min_len) * 1.5
-    # Minimal jitter 100 bytes (biar aman)
-    jitter = max(jitter, 100)
-
-    return (avg, min_len, max_len, jitter)
-
-
-def _structural_fingerprint(body):
-    """
-    Ambil fingerprint struktur dari HTML body.
-    Return: set of HTML tag names (untuk deteksi perubahan struktural).
-    """
-    if not body:
-        return set()
-    tags = re.findall(r"<(\w+)[\s>]", body, re.IGNORECASE)
-    return set(t.lower() for t in tags)
-
-
-def _structural_diff_score(body_a, body_b):
-    """
-    Hitung skor perbedaan struktural (0.0 - 1.0).
-    0.0 = identik struktur, 1.0 = beda total.
-    """
-    fp_a = _structural_fingerprint(body_a)
-    fp_b = _structural_fingerprint(body_b)
-    if not fp_a and not fp_b:
-        return 0.0
-    union = fp_a | fp_b
-    intersect = fp_a & fp_b
-    if not union:
-        return 0.0
-    return 1.0 - (len(intersect) / len(union))
-
-
-# ==========================================
 # GET SCAN
 # ==========================================
 async def _scan_get(scanner, params):
     param_list = list(params.keys())
     base = await scanner.baseline()
     base_body = base["body"] if base else ""
-
-    # ==========================================
-    # Ambil variance baseline SEBELUM test Boolean SQLi
-    # ==========================================
-    avg_len, min_len, max_len, jitter = await _get_response_variance(scanner, samples=3)
 
     # --- 1. SQLi Error-based ---
     tasks, meta = [], []
@@ -248,85 +194,48 @@ async def _scan_get(scanner, params):
         sig = _check_sqli_error(r.get("body", ""))
         if sig:
             scanner.add_finding(
-                "A05:2025 - Injection", "HIGH",
+                "A03: SQL Injection (Error-based)", "HIGH",
                 f"Parameter '{p}' rentan SQLi (error-based)",
                 mitigation="Gunakan Prepared Statements / Parameterized Queries. Validasi tipe input.",
                 evidence=f"Payload: {pl} | Sig: {sig}",
             )
             return True
 
-    # --- 2. SQLi Boolean-based (REWORKED dengan Response Variance Baseline) ---
+    # --- 2. SQLi Boolean-based ---
     for p in param_list:
         for tp, fp in SQLI_BOOLEAN_PAIRS:
             rt = await scanner.aget(_inject_get(scanner.target, p, tp))
             rf = await scanner.aget(_inject_get(scanner.target, p, fp))
             if not isinstance(rt, dict) or not isinstance(rf, dict):
                 continue
-
             body_t = rt.get("body", "")
             body_f = rf.get("body", "")
             if not body_t or not body_f:
                 continue
-
-            len_t = len(body_t)
-            len_f = len(body_f)
-            delta = abs(len_t - len_f)
-
-            # ==========================================
-            # VERIFIKASI 1: Delta harus melebihi jitter alami website
-            # ==========================================
-            if delta <= jitter:
-                continue  # Perbedaan cuma fluktuasi natural, skip
-
-            # ==========================================
-            # VERIFIKASI 2: TRUE response harus mirip dengan baseline asli
-            # (dalam toleransi jitter)
-            # ==========================================
-            if not base_body:
+            # TRUE mirip baseline, FALSE berbeda signifikan
+            len_t, len_f = len(body_t), len(body_f)
+            if len_t == len_f:
                 continue
-
-            len_base = len(base_body)
-            true_vs_base = abs(len_t - len_base)
-            if true_vs_base > jitter:
-                continue  # TRUE response beda dari baseline, bukan SQLi murni
-
-            # ==========================================
-            # VERIFIKASI 3: FALSE response harus beda STRUKTURAL
-            # (bukan cuma panjang, tapi struktur HTML-nya berubah)
-            # ==========================================
-            struct_score = _structural_diff_score(body_t, body_f)
-            if struct_score < 0.15:  # < 15% perbedaan struktur, tidak signifikan
-                continue
-
-            # ==========================================
-            # VERIFIKASI 4: Delta harus > 30% dari jitter untuk hindari edge case
-            # ==========================================
-            if delta < (jitter * 2):
-                continue
-
-            # ==========================================
-            # SEMUA VERIFIKASI LULUS → VALID SQLi BOOLEAN
-            # ==========================================
-            scanner.add_finding(
-                "A05:2025 - Injection", "HIGH",
-                f"Parameter '{p}' rentan SQLi (boolean-based)",
-                mitigation="Gunakan Prepared Statements + tipe data ketat. Validasi whitelist.",
-                evidence=(
-                    f"TRUE={len_t} vs FALSE={len_f} | Delta={delta} | "
-                    f"Jitter={jitter:.0f} | StructDiff={struct_score:.2f} | Payload: {tp}"
-                ),
-            )
-            return True
+            if abs(len_t - len_f) / max(len_t, len_f, 1) > 0.1:  # >10% beda
+                # Verifikasi: TRUE harus mirip baseline
+                if base_body and abs(len(body_t) - len(base_body)) / max(len(base_body), 1) < 0.2:
+                    scanner.add_finding(
+                        "A03: SQL Injection (Boolean-based)", "HIGH",
+                        f"Parameter '{p}' rentan SQLi (boolean-based)",
+                        mitigation="Prepared Statements + tipe data ketat",
+                        evidence=f"TRUE={len_t} vs FALSE={len_f} | Payload: {tp}",
+                    )
+                    return True
 
     # --- 3. SQLi Time-based ---
     for p in param_list:
         for pl, delay in SQLI_TIME_PAYLOADS:
-            t0 = time.perf_counter()
+            t0 = time.time()
             await scanner.aget(_inject_get(scanner.target, p, pl))
-            elapsed = time.perf_counter() - t0
+            elapsed = time.time() - t0
             if elapsed >= delay - 1.0:
                 scanner.add_finding(
-                    "A05:2025 - Injection", "HIGH",
+                    "A03: SQL Injection (Time-based)", "HIGH",
                     f"Parameter '{p}' rentan SQLi (time-based)",
                     mitigation="Prepared Statements + batasi query time",
                     evidence=f"Payload: {pl} | Delay: {elapsed:.2f}s",
@@ -343,7 +252,7 @@ async def _scan_get(scanner, params):
             sig = _check_nosql_error(r.get("body", ""))
             if sig:
                 scanner.add_finding(
-                    "A05:2025 - Injection", "HIGH",
+                    "A03: NoSQL Injection", "HIGH",
                     f"Parameter '{p}' rentan NoSQLi ({name})",
                     mitigation="Validasi tipe input, tolak operator query ($, {}) dari user",
                     evidence=f"Payload: {pl} | Sig: {sig}",
@@ -358,13 +267,14 @@ async def _scan_get(scanner, params):
                 continue
             body = r.get("body", "")
             if _reflects_payload(body, pl):
+                # Deteksi context
                 context = "HTML body"
                 if re.search(r"<script[^>]*>.*?" + re.escape(pl), body, re.DOTALL):
                     context = "Inside <script>"
                 elif re.search(r'="[^"]*' + re.escape(pl), body):
                     context = "Inside atribut"
                 scanner.add_finding(
-                    "A05:2025 - Injection", "HIGH",
+                    "A03: XSS (Reflected)", "HIGH",
                     f"Parameter '{p}' rentan Reflected XSS",
                     mitigation="HTML-escape output. Terapkan CSP ketat. Validasi input whitelist.",
                     evidence=f"Payload: {pl} | Context: {context}",
@@ -380,7 +290,7 @@ async def _scan_get(scanner, params):
             sig = _check_cmdi(r.get("body", ""))
             if sig:
                 scanner.add_finding(
-                    "A05:2025 - Injection", "HIGH",
+                    "A03: Command Injection", "HIGH",
                     f"Parameter '{p}' rentan Command Injection",
                     mitigation="Jangan pass input ke shell. Gunakan API spesifik. Validasi whitelist.",
                     evidence=f"Payload: {pl} | Sig: {sig}",
@@ -394,9 +304,10 @@ async def _scan_get(scanner, params):
             if not isinstance(r, dict):
                 continue
             body = r.get("body", "")
+            # Harus muncul hasil evaluasi TANPA payload mentah
             if expected in body and pl not in body:
                 scanner.add_finding(
-                    "A05:2025 - Injection", "HIGH",
+                    "A03: SSTI", "HIGH",
                     f"Parameter '{p}' rentan Server-Side Template Injection",
                     mitigation="Jangan render input user sebagai template. Gunakan sandbox.",
                     evidence=f"Payload: {pl} -> Result: {expected}",
@@ -431,9 +342,11 @@ async def _scan_post_endpoint(scanner, endpoint, payload, field_name):
         if sig:
             return ("CMDi JSON", sig, url)
 
+        # XSS reflection
         if _reflects_payload(body, payload):
             return ("XSS JSON", payload, url)
 
+        # SSTI
         for pl, expected in SSTI_PAYLOADS:
             if pl == payload and expected in body and pl not in body:
                 return ("SSTI JSON", f"{pl}->{expected}", url)
@@ -464,8 +377,10 @@ async def _scan_post_endpoint(scanner, endpoint, payload, field_name):
 
 async def _scan_post_fallback(scanner):
     """Kalau tidak ada GET param atau GET gagal, fuzz endpoint API."""
+    # Batasi endpoint untuk performa (ambil 8 pertama)
     endpoints_to_try = API_ENDPOINTS[:10]
 
+    # Payload prioritas
     priority_payloads = [
         "'", "\"", "' OR '1'='1", "1' AND SLEEP(5)--",
         "<svg/onload=alert(1)>", "; id", "{{7*7}}",
@@ -477,7 +392,7 @@ async def _scan_post_fallback(scanner):
             if result:
                 vuln_type, evidence, url = result
                 scanner.add_finding(
-                    "A05:2025 - Injection", "HIGH",
+                    f"A03: {vuln_type} (POST)", "HIGH",
                     f"Endpoint '{endpoint}' rentan {vuln_type} via POST",
                     mitigation=(
                         "Validasi input di server. Gunakan prepared statements untuk SQLi, "
@@ -503,7 +418,7 @@ async def _run(scanner):
         if found:
             return
 
-    # --- Phase 2: POST fallback ---
+    # --- Phase 2: POST fallback (selalu coba) ---
     found = await _scan_post_fallback(scanner)
     if found:
         return
@@ -511,12 +426,12 @@ async def _run(scanner):
     # --- No vuln found ---
     if params:
         scanner.add_finding(
-            "A05:2025 - Injection", "SAFE",
+            "A03: Injection", "SAFE",
             f"Tidak ada injection pada GET param ({', '.join(params.keys())}) & POST fallback",
         )
     else:
         scanner.add_finding(
-            "A05:2025 - Injection", "SAFE",
+            "A03: Injection", "SAFE",
             f"Tidak ada GET param & {len(API_ENDPOINTS[:10])} endpoint API diuji aman",
         )
 
@@ -529,4 +444,4 @@ def scan(scanner):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(_run(scanner))
     except Exception as e:
-        scanner.add_finding("A05:2025 - Injection", "INFO", f"Error: {e}")
+        scanner.add_finding("A03: Injection", "INFO", f"Error: {e}")

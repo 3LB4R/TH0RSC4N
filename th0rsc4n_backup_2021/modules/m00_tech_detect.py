@@ -1,10 +1,10 @@
-"""M00 - Technology Fingerprinting (clean version)."""
+"""M00 - Technology Fingerprinting (robust)."""
 import re
 from bs4 import BeautifulSoup
 
 
 # ==========================================
-# TECH SIGNATURES
+# SIGNATURE DATABASE
 # ==========================================
 TECH_SIGNATURES = {
     # Frontend
@@ -26,7 +26,7 @@ TECH_SIGNATURES = {
     # Build Tool
     "Vite": ["/@vite/", "vite/client", "vite/dist"],
     "Webpack": ["webpack", "__webpack_require__"],
-    "Turbopack": ["turbopack"],
+    "Turbopack": ["turbopack", "turbopack"],
     "esbuild": ["esbuild"],
     "Parcel": ["parcelRequire"],
     # CSS
@@ -108,6 +108,7 @@ CATEGORY_MAP = {
     "PWA": "Feature",
 }
 
+# Header-based detect
 HEADER_MAP = {
     "server:vercel": ("Vercel", "Platform"),
     "server:netlify": ("Netlify", "Platform"),
@@ -132,11 +133,9 @@ HEADER_MAP = {
 }
 
 
-# ==========================================
-# SCAN — SINGLE ENTRY POINT
-# ==========================================
 def scan(scanner):
-    """Detect technologies used by target — 1x report only."""
+    """Detect technologies used by target."""
+    # Coba 3 strategi ambil HTML
     html = ""
     headers = {}
     cookies = {}
@@ -150,7 +149,7 @@ def scan(scanner):
         except Exception:
             pass
 
-    # Fallback fetch manual
+    # Fallback: kalau html kosong, ambil manual via requests
     if not html or len(html) < 100:
         try:
             import requests
@@ -169,60 +168,21 @@ def scan(scanner):
         scanner.tech_by_category = {}
         return
 
-    soup = BeautifulSoup(html, "html.parser")
     detected = []
+    html_lower = html.lower()
 
-    # ==========================================
-    # 1. Detect via script src & link href
-    # ==========================================
-    asset_urls = []
-    for s in soup.find_all("script", src=True):
-        asset_urls.append(s["src"].lower())
-    for l in soup.find_all("link", href=True):
-        asset_urls.append(l["href"].lower())
-    assets_blob = " ".join(asset_urls)
-
+    # ========== DETECT VIA HTML ==========
     for tech_name, keywords in TECH_SIGNATURES.items():
         for kw in keywords:
-            if kw.lower() in assets_blob:
+            if kw.lower() in html_lower:
                 detected.append({
                     "name": tech_name,
                     "category": CATEGORY_MAP.get(tech_name, "Other"),
-                    "evidence": f"asset: {kw}",
+                    "evidence": f"pattern: {kw}",
                 })
                 break
 
-    # ==========================================
-    # 2. Detect via meta generator
-    # ==========================================
-    gen = soup.find("meta", attrs={"name": "generator"})
-    if gen:
-        content = gen.get("content", "").lower()
-        for tech_name, keywords in TECH_SIGNATURES.items():
-            for kw in keywords:
-                if kw.lower() in content:
-                    if not any(d["name"] == tech_name for d in detected):
-                        detected.append({
-                            "name": tech_name,
-                            "category": CATEGORY_MAP.get(tech_name, "Other"),
-                            "evidence": "meta generator",
-                        })
-                    break
-
-    # ==========================================
-    # 3. Detect Astro (spesifik pattern)
-    # ==========================================
-    if re.search(r"<astro-island|data-astro-cid|astro-slot", html, re.IGNORECASE):
-        if not any(d["name"] == "Astro" for d in detected):
-            detected.append({
-                "name": "Astro",
-                "category": "Full-Stack",
-                "evidence": "astro-island pattern",
-            })
-
-    # ==========================================
-    # 4. Detect via headers
-    # ==========================================
+    # ========== DETECT VIA HEADERS ==========
     for key, (tech_name, category) in HEADER_MAP.items():
         if ":" in key:
             h_key, h_val = key.split(":", 1)
@@ -231,9 +191,10 @@ def scan(scanner):
                     detected.append({
                         "name": tech_name,
                         "category": category,
-                        "evidence": f"header {h_key}",
+                        "evidence": f"header {h_key}: {h_val}",
                     })
         else:
+            # Header tanpa value (contoh: cf-ray)
             if key in headers:
                 if not any(d["name"] == tech_name for d in detected):
                     detected.append({
@@ -242,9 +203,7 @@ def scan(scanner):
                         "evidence": f"header {key}",
                     })
 
-    # ==========================================
-    # 5. Detect via cookies
-    # ==========================================
+    # ========== DETECT VIA COOKIES ==========
     cookie_map = {
         "PHPSESSID": ("PHP", "Backend"),
         "laravel_session": ("Laravel", "Backend"),
@@ -261,13 +220,12 @@ def scan(scanner):
                     "evidence": f"cookie: {ck}",
                 })
 
-    # ==========================================
-    # 6. Group & Report — SEKALI SAJA
-    # ==========================================
+    # ========== GROUP BY CATEGORY ==========
     by_category = {}
     for t in detected:
         by_category.setdefault(t["category"], []).append(t["name"])
 
+    # ========== REPORT ==========
     if detected:
         names = sorted(set(t["name"] for t in detected))
         scanner.add_finding(
@@ -283,6 +241,6 @@ def scan(scanner):
         scanner.add_finding("M00: Tech Detect", "SAFE",
                             "Tidak ada teknologi yang match signature")
 
-    # Save ke scanner
+    # Save
     scanner.detected_tech = detected
     scanner.tech_by_category = by_category

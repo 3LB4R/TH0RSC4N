@@ -26,7 +26,7 @@ class Scanner:
     """Async scanner engine dengan persistent session pool."""
 
     def __init__(self, target, timeout=10, user_agent=None, verbose=False,
-                 verify_ssl=False, concurrency=25):
+                 verify_ssl=False, concurrency=15):
         self.target = normalize_url(target)
         self.timeout = timeout
         self.verbose = verbose
@@ -60,8 +60,8 @@ class Scanner:
         """Buat 1x persistent session + semaphore."""
         if HAS_AIOHTTP:
             connector = aiohttp.TCPConnector(
-                limit=50,
-                limit_per_host=50,
+                limit=self.concurrency * 2,
+                limit_per_host=self.concurrency,
                 ttl_dns_cache=300,
                 enable_cleanup_closed=True,
             )
@@ -72,7 +72,7 @@ class Scanner:
                 headers=self.headers,
                 skip_auto_headers={"Accept-Encoding"},
             )
-        self._semaphore = asyncio.Semaphore(50)
+        self._semaphore = asyncio.Semaphore(self.concurrency)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -107,62 +107,33 @@ class Scanner:
         return finding
 
     def _detect_module(self, category):
-        """Detect nama modul dari kategori — mapping OWASP 2025 yang BENAR."""
+        """Detect nama modul dari kategori."""
         cat = category.lower()
-
-        # M00 — Tech Detect (paling spesifik, cek dulu)
-        if cat.startswith("m00") or "tech detect" in cat or "fingerprint" in cat:
+        if "m00" in cat or "tech" in cat:
             return "m00_tech_detect"
-
-        # A01: BAC
-        if "a01" in cat or "broken access" in cat or "bac" in cat or "idor" in cat:
+        if "a01" in cat or "bac" in cat or "idor" in cat or "cors" in cat:
             return "m01_bac"
-
-        # A10: SSRF (masuk A10 di 2025)
-        if "ssrf" in cat or "m10" in cat:
-            return "m10_ssrf"
-
-        # A02: Misconfiguration (headers, sensitive files)
-        if "a02" in cat or "misconfig" in cat or "header" in cat or "sensitive file" in cat:
-            return "m05_misconfig"
-
-        # A03: Supply Chain
-        if "a03" in cat or "component" in cat or "supply chain" in cat or "cve" in cat:
-            return "m06_components"
-
-        # A04: Crypto
-        if "a04" in cat or "crypto" in cat or "tls" in cat or "certificate" in cat or "mixed content" in cat:
+        if "a02" in cat or "crypto" in cat or "tls" in cat:
             return "m02_crypto"
-
-        # A05: Injection
-        if "a05" in cat or "injection" in cat or "sqli" in cat or "xss" in cat or "cmdi" in cat or "ssti" in cat:
+        if "a03" in cat or "injection" in cat or "sqli" in cat or "xss" in cat:
             return "m03_injection"
-
-        # A06: Insecure Design
-        if "a06" in cat or "design" in cat or "rate limit" in cat or "business logic" in cat:
+        if "a04" in cat or "design" in cat or "rate" in cat:
             return "m04_design"
-
-        # A07: Auth
-        if "a07" in cat or "auth" in cat or "jwt" in cat or "session" in cat:
+        if "a05" in cat or "misconfig" in cat or "header" in cat:
+            return "m05_misconfig"
+        if "a06" in cat or "component" in cat or "cve" in cat:
+            return "m06_components"
+        if "a07" in cat or "auth" in cat or "jwt" in cat:
             return "m07_auth"
-
-        # A08: Integrity
-        if "a08" in cat or "integrity" in cat or "deserialization" in cat or "prototype" in cat:
+        if "a08" in cat or "integrity" in cat:
             return "m08_integrity"
-
-        # A09: Logging
-        if "a09" in cat or "logging" in cat or "security.txt" in cat:
+        if "a09" in cat or "logging" in cat:
             return "m09_logging"
-
-        # A10: Mishandling (DoS, request smuggling)
-        if "a10" in cat or "exceptional" in cat or "mishandling" in cat or "dos" in cat:
-            return "m99_extra"
-
-        # M99 Extra
+        if "a10" in cat or "ssrf" in cat:
+            return "m10_ssrf"
         if "m99" in cat or "extra" in cat:
             return "m99_extra"
-
-        return "m00_tech_detect"
+        return "unknown"
 
     # ==========================================
     # SYNC HTTP (untuk modul lama)
